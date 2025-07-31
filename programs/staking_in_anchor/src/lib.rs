@@ -1,6 +1,10 @@
 use anchor_lang::prelude::*;
 use anchor_lang::system_program;
 
+const POINTS_PER_SOL_PER_DAY :u64 = 1_000_000;
+const LAMPORTS_PER_SOL:u64 = 1_000_000_000;
+const SECONDS_PER_DAY:u64 = 86_400;
+
 declare_id!("FRqafj3DiwKbsnkCF3KRDEDdBRm1yrXymp3r8fBq6Lbp");
 
 #[program]
@@ -26,17 +30,19 @@ pub mod staking_in_anchor {
         msg!("Staking initialized");
         require!(amount > 0, StakeError::InvalidAmount);
 
+        let pda_acount_info = ctx.accounts.pda_account.to_account_info();
+
         let pda_account = &mut ctx.accounts.pda_account;
         let clock = Clock::get()?;
 
-        update_points(pda_account,clock.unix_timestamp);
+        update_points(pda_account,clock.unix_timestamp)?;
 
         // Transferring sol from user to pda account
         let cpi_context = CpiContext::new(
             ctx.accounts.system_program.to_account_info(),
             system_program::Transfer{
                 from: ctx.accounts.user.to_account_info(),
-                to: ctx.accounts.pda_account.to_account_info(),
+                to: pda_acount_info,
             },
         );
         system_program::transfer(cpi_context, amount)?;
@@ -45,6 +51,74 @@ pub mod staking_in_anchor {
 
         msg!("Staked {} lamports. Total staked: {}, Total points: {}", 
              amount, pda_account.staked_amount, pda_account.total_points / 1_000_000);
+        Ok(())
+    }
+
+    pub fn unstake(ctx: Context<Unstake>,amount:u64) -> Result<()>{
+
+        require!(amount > 0, StakeError::InvalidAmount);
+
+        let pda_account_info = ctx.accounts.pda_account.to_account_info();
+
+        let pda_account = &mut ctx.accounts.pda_account;
+        let clock = Clock::get()?;
+
+        require!(pda_account.staked_amount >= amount,StakeError::InsufficientFunds);
+
+        update_points(pda_account, clock.unix_timestamp)?;
+
+        let seeds = &[
+            b"client1",
+            ctx.accounts.user.key.as_ref(),
+            &[pda_account.bump],
+        ];
+        let signer = &[&seeds[..]];
+
+        let cpi_context = CpiContext::new_with_signer(
+                ctx.accounts.system_program.to_account_info(),
+             system_program::Transfer{
+                from: pda_account_info,
+                to: ctx.accounts.user.to_account_info(),
+             },
+              signer,
+            );
+
+            system_program::transfer(cpi_context, amount)?;
+
+            pda_account.staked_amount = pda_account.staked_amount.checked_sub(amount).ok_or(StakeError::Underflow)?;
+
+             
+        msg!("Unstaked {} lamports. Remaining staked: {}, Total points: {}", 
+             amount, pda_account.staked_amount, pda_account.total_points / 1_000_000);
+        Ok(())
+    }
+
+    pub fn get_points(ctx:Context<GetPoints>) -> Result<()> {
+        let pda_account = &ctx.accounts.pda_account;
+        let clock = Clock::get()?;
+
+        let time_elapsed = clock.unix_timestamp.checked_sub(pda_account.last_updated_time).ok_or(StakeError::InvalidTimeStamp)? as u64;
+
+        let new_points = calculate_points(pda_account.staked_amount, time_elapsed)?;
+        let current_total_points = pda_account.total_points.checked_add(new_points).ok_or(StakeError::Overflow)?;
+
+        msg!("Current Points: {}, Staked Amount: {} SOL",
+        current_total_points / 1_000_000,
+        pda_account.staked_amount / LAMPORTS_PER_SOL);
+
+        Ok(())
+    }
+
+    pub fn claim_points(ctx: Context<ClaimPoints>) -> Result<()>{
+        let pda_account = &mut ctx.accounts.pda_account;
+        let clock = Clock::get()?;
+
+        update_points(pda_account, clock.unix_timestamp)?;
+
+        let claimable_points = pda_account.total_points / 1_000_000;
+
+        msg!("User has {} claimable points", claimable_points);
+
         Ok(())
     }
 }
@@ -60,6 +134,16 @@ fn update_points(pda_account : &mut StakeAccount,current_time: i64) -> Result<()
 
     pda_account.last_updated_time = current_time;
     Ok(())
+}
+
+fn calculate_points(staked_amount : u64, time_elapsed_seconds: u64) -> Result<u64>{
+    let points = (staked_amount as u128)
+    .checked_mul(time_elapsed_seconds.into()).ok_or(StakeError::Overflow)?
+    .checked_mul(POINTS_PER_SOL_PER_DAY as u128).ok_or(StakeError::Overflow)?
+    .checked_mul(LAMPORTS_PER_SOL as u128).ok_or(StakeError::Overflow)?
+    .checked_mul(SECONDS_PER_DAY as u128).ok_or(StakeError::Overflow)?;
+
+    Ok(points as u64)
 }
 
 #[derive(Accounts)]
@@ -93,6 +177,50 @@ pub struct Stake<'info>{
     pub system_program: Program<'info,System>
 }
 
+#[derive(Accounts)]
+pub struct Unstake<'info>{
+    #[account(mut)]
+    pub user: Signer<'info>,
+
+    #[account(
+        mut,
+        seeds = [b"client1",user.key().as_ref()],
+        bump = pda_account.bump,
+        constraint = pda_account.owner == user.key() @ StakeError::UnauthorizedOwner
+    )]
+    pub pda_account : Account<'info,StakeAccount>,
+
+    pub system_program: Program<'info,System>
+}
+
+#[derive(Accounts)]
+pub struct GetPoints<'info>{
+    #[account(mut)]
+    pub user : Signer<'info>,
+
+    #[account(
+        mut,
+        seeds = [b"client1",user.key().as_ref()],
+        bump = pda_account.bump,
+        constraint = pda_account.owner == user.key() @ StakeError::UnauthorizedOwner
+    )]
+    pub pda_account: Account<'info,StakeAccount>
+}
+
+#[derive(Accounts)]
+pub struct ClaimPoints<'info>{
+    #[account(mut)]
+    pub user : Signer<'info>,
+
+    #[account(
+        mut,
+        seeds = [b"client1",user.key().as_ref()],
+        bump = pda_account.bump,
+        constraint = pda_account.owner == user.key() @ StakeError::UnauthorizedOwner
+    )]
+    pub pda_account: Account<'info,StakeAccount>
+}
+
 #[account]
 pub struct StakeAccount{
     pub owner: Pubkey,             //   32 bytes 
@@ -112,4 +240,8 @@ pub enum StakeError{
     Overflow,
     #[msg("Invalid Timestamp")]
     InvalidTimeStamp,
+    #[msg("Funds are insufficient")]
+    InsufficientFunds,
+    #[msg("Arithmetic underflow")]
+    Underflow,
 }
